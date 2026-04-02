@@ -6,7 +6,6 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
-# ===== ENV =====
 TOKEN = os.getenv("BOT_TOKEN")
 DOOD_API_KEY = os.getenv("DOOD_API_KEY")
 
@@ -16,22 +15,19 @@ if not TOKEN:
 if not DOOD_API_KEY:
     raise ValueError("DOOD_API_KEY tidak ditemukan!")
 
-# ===== SETTINGS =====
 COOLDOWN = 30
-MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024
 
 user_cooldowns = {}
 queue = asyncio.Queue()
 
 # ===== GET DIRECT LINK =====
-def get_direct_link(dood_url):
-    api_url = f"https://doodapi.com/api/file/direct_link?key={DOOD_API_KEY}&url={dood_url}"
-    r = requests.get(api_url, timeout=30)
+def get_direct_link(url):
+    api = f"https://doodapi.com/api/file/direct_link?key={DOOD_API_KEY}&url={url}"
+    r = requests.get(api, timeout=30)
     data = r.json()
-
     if data.get("status") != 200:
         return None
-
     return data["result"]["download_url"]
 
 # ===== DOWNLOAD FILE =====
@@ -39,19 +35,9 @@ def download_file(url, filename):
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         with open(filename, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
+            for chunk in r.iter_content(8192):
                 if chunk:
                     f.write(chunk)
-
-# ===== WORKER =====
-async def worker(app):
-    while True:
-        update = await queue.get()
-        try:
-            await process_download(update)
-        except Exception as e:
-            await update.message.reply_text(f"⚠️ Error: {str(e)}")
-        queue.task_done()
 
 # ===== PROCESS DOWNLOAD =====
 async def process_download(update: Update):
@@ -78,9 +64,7 @@ async def process_download(update: Update):
 
     await asyncio.to_thread(download_file, direct_link, filename)
 
-    file_size = os.path.getsize(filename)
-
-    if file_size > MAX_FILE_SIZE:
+    if os.path.getsize(filename) > MAX_FILE_SIZE:
         os.remove(filename)
         await update.message.reply_text("❌ File lebih dari 2GB.")
         return
@@ -103,14 +87,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_cooldowns[user_id] = now
 
-    await update.message.reply_text("📥 Masuk antrian...")
-    await queue.put(update)
+    await process_download(update)
 
 # ===== RUN =====
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-app.job_queue.run_once(lambda ctx: asyncio.create_task(worker(app)), 0)
 
 print("Dood Remote Bot Running...")
 app.run_polling()
