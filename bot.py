@@ -3,143 +3,179 @@ import re
 import time
 import asyncio
 import requests
+from collections import defaultdict
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+
+# ================= CONFIG =================
 
 TOKEN = os.getenv("BOT_TOKEN")
+
+# Streamtape
 STREAMTAPE_LOGIN = os.getenv("STREAMTAPE_LOGIN")
 STREAMTAPE_KEY = os.getenv("STREAMTAPE_KEY")
 
-if not TOKEN:
-    raise ValueError("BOT_TOKEN tidak ditemukan!")
+# Dood
+DOOD_API_KEY = os.getenv("DOOD_API_KEY")
 
-if not STREAMTAPE_LOGIN or not STREAMTAPE_KEY:
-    raise ValueError("Streamtape login/key belum di-set!")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
 
-COOLDOWN = 30
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 3))
+PER_USER_LIMIT = 20
+COOLDOWN = 5
+MAX_RETRY = 2
+
+# ================= GLOBAL STATE =================
+
+queue = asyncio.Queue()
+semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
 user_cooldowns = {}
+user_queue_count = defaultdict(int)
+banned_users = set()
 
-# =========================
-# STREAMTAPE API
-# =========================
+stats = {
+    "processed": 0,
+    "failed": 0,
+    "start_time": time.time()
+}
 
-def remote_add(url):
+# ================= HOST DETECTOR =================
+
+def detect_host(url):
+    if "streamtape.com" in url:
+        return "streamtape"
+    if "dood." in url or "doodstream" in url:
+        return "dood"
+    return "streamtape"  # default fallback
+
+# ================= STREAMTAPE =================
+
+def streamtape_remote_add(url):
     api = f"https://api.streamtape.com/remotedl/add?login={STREAMTAPE_LOGIN}&key={STREAMTAPE_KEY}&url={url}"
-    r = requests.get(api, timeout=60)
-    return r.json()
+    return requests.get(api, timeout=60).json()
 
-def remote_status():
+def streamtape_status():
     api = f"https://api.streamtape.com/remotedl/status?login={STREAMTAPE_LOGIN}&key={STREAMTAPE_KEY}"
-    r = requests.get(api, timeout=60)
-    return r.json()
+    return requests.get(api, timeout=60).json()
 
-def upload_file(filepath):
-    api = f"https://api.streamtape.com/file/ul?login={STREAMTAPE_LOGIN}&key={STREAMTAPE_KEY}"
-    with open(filepath, "rb") as f:
-        files = {"file1": f}
-        r = requests.post(api, files=files, timeout=600)
-    return r.json()
+# ================= DOOD =================
 
-# =========================
-# HANDLE URL (REMOTE)
-# =========================
+def dood_remote_add(url):
+    api = f"https://doodapi.com/api/upload/url?key={DOOD_API_KEY}&url={url}"
+    return requests.get(api, timeout=60).json()
+
+# ================= WORKER =================
+
+async def worker(app):
+    while True:
+        chat_id, user_id, url, retry = await queue.get()
+
+        async with semaphore:
+            try:
+                host = detect_host(url)
+
+                await app.bot.send_message(chat_id, f"🚀 Processing ({host})")
+
+                if host == "streamtape":
+                    result = streamtape_remote_add(url)
+                    if result.get("status") != 200:
+                        raise Exception("Streamtape add failed")
+
+                    finished = False
+                    for _ in range(30):
+                        await asyncio.sleep(10)
+                        status = streamtape_status()
+                        if status.get("status") != 200:
+                            continue
+                        for f in status.get("result", []):
+                            if f.get("status") == "finished":
+                                link = f"https://streamtape.com/v/{f.get('file_id')}"
+                                await app.bot.send_message(chat_id, f"✅ Done\n🔗 {link}")
+                                finished = True
+                                break
+                        if finished:
+                            break
+                    if not finished:
+                        raise Exception("Timeout")
+
+                elif host == "dood":
+                    result = dood_remote_add(url)
+                    if result.get("status") != 200:
+                        raise Exception("Dood add failed")
+
+                    filecode = result["result"][0]["filecode"]
+                    link = f"https://dood.stream/d/{filecode}"
+                    await app.bot.send_message(chat_id, f"✅ Uploaded\n🔗 {link}")
+
+                stats["processed"] += 1
+
+            except Exception:
+                if retry < MAX_RETRY:
+                    await queue.put((chat_id, user_id, url, retry + 1))
+                else:
+                    await app.bot.send_message(chat_id, f"❌ Failed:\n{url}")
+                    stats["failed"] += 1
+
+            user_queue_count[user_id] -= 1
+            queue.task_done()
+
+# ================= MESSAGE HANDLER =================
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    now = time.time()
+    chat_id = update.effective_chat.id
 
+    if user_id in banned_users:
+        return
+
+    now = time.time()
     if user_id in user_cooldowns:
-        remaining = COOLDOWN - (now - user_cooldowns[user_id])
-        if remaining > 0:
-            await update.message.reply_text(f"⏳ Tunggu {int(remaining)} detik.")
+        if now - user_cooldowns[user_id] < COOLDOWN:
             return
 
     user_cooldowns[user_id] = now
 
     urls = re.findall(r'(https?://[^\s]+)', update.message.text)
-
     if not urls:
-        await update.message.reply_text("❌ Kirim link yang valid.")
         return
 
-    await update.message.reply_text("🚀 Menambahkan ke remote upload...")
-
-    add_result = remote_add(urls[0])
-
-    if add_result.get("status") != 200:
-        await update.message.reply_text("❌ Gagal menambahkan remote upload.")
+    if user_queue_count[user_id] + len(urls) > PER_USER_LIMIT:
+        await update.message.reply_text("❌ Limit antrian tercapai.")
         return
 
-    await update.message.reply_text("⏳ Menunggu proses selesai...")
-
-    # Tunggu sampai selesai (maks 5 menit)
-    for _ in range(30):
-        await asyncio.sleep(10)
-        status_result = remote_status()
-
-        if status_result.get("status") != 200:
-            continue
-
-        files = status_result.get("result", [])
-
-        for file in files:
-            if file.get("status") == "finished":
-                fileid = file.get("file_id")
-                stream_link = f"https://streamtape.com/v/{fileid}"
-                await update.message.reply_text(
-                    f"✅ Upload selesai!\n\n🔗 {stream_link}"
-                )
-                return
-
-    await update.message.reply_text("❌ Timeout. Cek dashboard Streamtape.")
-
-# =========================
-# HANDLE FILE (DIRECT UPLOAD)
-# =========================
-
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    now = time.time()
-
-    if user_id in user_cooldowns:
-        remaining = COOLDOWN - (now - user_cooldowns[user_id])
-        if remaining > 0:
-            await update.message.reply_text(f"⏳ Tunggu {int(remaining)} detik.")
-            return
-
-    user_cooldowns[user_id] = now
-
-    await update.message.reply_text("⬇️ Download file dari Telegram...")
-
-    file = await update.message.document.get_file()
-    filepath = "upload.mp4"
-    await file.download_to_drive(filepath)
-
-    await update.message.reply_text("🚀 Upload ke Streamtape...")
-
-    result = upload_file(filepath)
-
-    os.remove(filepath)
-
-    if result.get("status") != 200:
-        await update.message.reply_text("❌ Upload gagal.")
-        return
-
-    fileid = result["result"]["url"].split("/")[-1]
-    stream_link = f"https://streamtape.com/v/{fileid}"
+    for url in urls:
+        await queue.put((chat_id, user_id, url, 0))
+        user_queue_count[user_id] += 1
 
     await update.message.reply_text(
-        f"✅ Upload selesai!\n\n🔗 {stream_link}"
+        f"📦 {len(urls)} link masuk queue\n⚡ Parallel: {MAX_CONCURRENT}"
     )
 
-# =========================
-# RUN
-# =========================
+# ================= ADMIN =================
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uptime = int(time.time() - stats["start_time"])
+    await update.message.reply_text(
+        f"📊 Stats\n"
+        f"Processed: {stats['processed']}\n"
+        f"Failed: {stats['failed']}\n"
+        f"In Queue: {queue.qsize()}\n"
+        f"Uptime: {uptime}s"
+    )
+
+# ================= MAIN =================
 
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+app.add_handler(CommandHandler("stats", stats_cmd))
 
-print("Streamtape PRO Bot Running...")
+async def start_workers(app):
+    for _ in range(MAX_CONCURRENT):
+        asyncio.create_task(worker(app))
+
+app.post_init = start_workers
+
+print("🔥 Multi-Host PRO Bot Running...")
 app.run_polling()
