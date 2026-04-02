@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import asyncio
 import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
@@ -19,25 +20,30 @@ COOLDOWN = 30
 user_cooldowns = {}
 
 # =========================
-# Upload via URL
+# STREAMTAPE API
 # =========================
-def upload_url_to_streamtape(url):
-    api = f"https://api.streamtape.com/file/ul?login={STREAMTAPE_LOGIN}&key={STREAMTAPE_KEY}&url={url}"
+
+def remote_add(url):
+    api = f"https://api.streamtape.com/remotedl/add?login={STREAMTAPE_LOGIN}&key={STREAMTAPE_KEY}&url={url}"
     r = requests.get(api, timeout=60)
     return r.json()
 
-# =========================
-# Upload File Direct
-# =========================
-def upload_file_to_streamtape(filepath):
+def remote_status():
+    api = f"https://api.streamtape.com/remotedl/status?login={STREAMTAPE_LOGIN}&key={STREAMTAPE_KEY}"
+    r = requests.get(api, timeout=60)
+    return r.json()
+
+def upload_file(filepath):
     api = f"https://api.streamtape.com/file/ul?login={STREAMTAPE_LOGIN}&key={STREAMTAPE_KEY}"
-    files = {"file1": open(filepath, "rb")}
-    r = requests.post(api, files=files, timeout=300)
+    with open(filepath, "rb") as f:
+        files = {"file1": f}
+        r = requests.post(api, files=files, timeout=600)
     return r.json()
 
 # =========================
-# Handle Text (URL Upload)
+# HANDLE URL (REMOTE)
 # =========================
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     now = time.time()
@@ -56,21 +62,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Kirim link yang valid.")
         return
 
-    await update.message.reply_text("🚀 Remote upload ke Streamtape...")
+    await update.message.reply_text("🚀 Menambahkan ke remote upload...")
 
-    result = upload_url_to_streamtape(urls[0])
+    add_result = remote_add(urls[0])
 
-    if result.get("status") != 200:
-        await update.message.reply_text("❌ Upload gagal.")
+    if add_result.get("status") != 200:
+        await update.message.reply_text("❌ Gagal menambahkan remote upload.")
         return
 
-    link = result["result"]["url"]
+    await update.message.reply_text("⏳ Menunggu proses selesai...")
 
-    await update.message.reply_text(f"✅ Upload selesai!\n\n🔗 {link}")
+    # Tunggu sampai selesai (maks 5 menit)
+    for _ in range(30):
+        await asyncio.sleep(10)
+        status_result = remote_status()
+
+        if status_result.get("status") != 200:
+            continue
+
+        files = status_result.get("result", [])
+
+        for file in files:
+            if file.get("status") == "finished":
+                fileid = file.get("file_id")
+                stream_link = f"https://streamtape.com/v/{fileid}"
+                await update.message.reply_text(
+                    f"✅ Upload selesai!\n\n🔗 {stream_link}"
+                )
+                return
+
+    await update.message.reply_text("❌ Timeout. Cek dashboard Streamtape.")
 
 # =========================
-# Handle File Upload
+# HANDLE FILE (DIRECT UPLOAD)
 # =========================
+
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     now = time.time()
@@ -91,7 +117,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("🚀 Upload ke Streamtape...")
 
-    result = upload_file_to_streamtape(filepath)
+    result = upload_file(filepath)
 
     os.remove(filepath)
 
@@ -99,17 +125,21 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Upload gagal.")
         return
 
-    link = result["result"]["url"]
+    fileid = result["result"]["url"].split("/")[-1]
+    stream_link = f"https://streamtape.com/v/{fileid}"
 
-    await update.message.reply_text(f"✅ Upload selesai!\n\n🔗 {link}")
+    await update.message.reply_text(
+        f"✅ Upload selesai!\n\n🔗 {stream_link}"
+    )
 
 # =========================
 # RUN
 # =========================
+
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
 
-print("Streamtape Bot Running...")
+print("Streamtape PRO Bot Running...")
 app.run_polling()
