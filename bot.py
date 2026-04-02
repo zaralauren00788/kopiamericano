@@ -1,13 +1,10 @@
 import os
-import re
-import time
 import asyncio
 import requests
 from datetime import datetime
 from collections import defaultdict
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
-from moviepy.editor import VideoFileClip
 
 # ================= CONFIG =================
 
@@ -18,8 +15,6 @@ STREAMTAPE_KEY = os.getenv("STREAMTAPE_KEY")
 MAX_FILE_SIZE = 1024 * 1024 * 1024  # 1GB
 MAX_UPLOAD_PER_DAY = 10
 MAX_CONCURRENT = 2
-
-# ================= STATE =================
 
 daily_usage = defaultdict(lambda: {"count": 0, "date": str(datetime.utcnow().date())})
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
@@ -33,7 +28,7 @@ def upload_to_streamtape(filepath):
         r = requests.post(url, files=files, timeout=600)
     return r.json()
 
-# ================= DAILY LIMIT =================
+# ================= LIMIT =================
 
 def check_daily_limit(user_id):
     today = str(datetime.utcnow().date())
@@ -44,13 +39,13 @@ def check_daily_limit(user_id):
 def increase_daily(user_id):
     daily_usage[user_id]["count"] += 1
 
-# ================= PROGRESS BAR =================
+# ================= PROGRESS =================
 
 def progress_bar(percent):
     blocks = int(percent / 10)
     return "█" * blocks + "░" * (10 - blocks)
 
-# ================= VIDEO HANDLER =================
+# ================= HANDLER =================
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with semaphore:
@@ -79,18 +74,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await file.download_to_drive(filepath)
 
-        await msg.edit_text("🎬 Membuat thumbnail...")
-
-        thumb_path = f"/tmp/thumb_{video.file_unique_id}.jpg"
-
-        try:
-            clip = VideoFileClip(filepath)
-            clip.save_frame(thumb_path, t=1)
-            clip.close()
-        except:
-            thumb_path = None
-
-        await msg.edit_text("⬆️ Uploading to Streamtape...\n░░░░░░░░░░ 0%")
+        await msg.edit_text("⬆️ Uploading to Streamtape...")
 
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, upload_to_streamtape, filepath)
@@ -110,13 +94,9 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists(filepath):
             os.remove(filepath)
 
-        if thumb_path and os.path.exists(thumb_path):
-            os.remove(thumb_path)
-
 # ================= START =================
 
 app = ApplicationBuilder().token(TOKEN).build()
-
 app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
 
 print("🔥 Streamtape Upload Bot Running...")
