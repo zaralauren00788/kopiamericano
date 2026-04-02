@@ -6,7 +6,7 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
-# ====== ENV ======
+# ===== ENV =====
 TOKEN = os.getenv("BOT_TOKEN")
 DOOD_API_KEY = os.getenv("DOOD_API_KEY")
 
@@ -16,14 +16,14 @@ if not TOKEN:
 if not DOOD_API_KEY:
     raise ValueError("DOOD_API_KEY tidak ditemukan!")
 
-# ====== SETTINGS ======
-COOLDOWN = 30  # detik
+# ===== SETTINGS =====
+COOLDOWN = 30
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
 
 user_cooldowns = {}
 queue = asyncio.Queue()
 
-# ====== GET DIRECT LINK FROM DOOD ======
+# ===== GET DIRECT LINK =====
 def get_direct_link(dood_url):
     api_url = f"https://doodapi.com/api/file/direct_link?key={DOOD_API_KEY}&url={dood_url}"
     r = requests.get(api_url, timeout=30)
@@ -34,7 +34,7 @@ def get_direct_link(dood_url):
 
     return data["result"]["download_url"]
 
-# ====== DOWNLOAD FILE ======
+# ===== DOWNLOAD FILE =====
 def download_file(url, filename):
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
@@ -43,8 +43,8 @@ def download_file(url, filename):
                 if chunk:
                     f.write(chunk)
 
-# ====== WORKER ======
-async def worker():
+# ===== WORKER =====
+async def worker(app):
     while True:
         update = await queue.get()
         try:
@@ -53,11 +53,11 @@ async def worker():
             await update.message.reply_text(f"⚠️ Error: {str(e)}")
         queue.task_done()
 
-# ====== PROCESS DOWNLOAD ======
+# ===== PROCESS DOWNLOAD =====
 async def process_download(update: Update):
     text = update.message.text.strip()
-
     urls = re.findall(r'(https?://[^\s]+)', text)
+
     if not urls:
         await update.message.reply_text("❌ Link tidak valid.")
         return
@@ -82,21 +82,19 @@ async def process_download(update: Update):
 
     if file_size > MAX_FILE_SIZE:
         os.remove(filename)
-        await update.message.reply_text("❌ File lebih dari 2GB (limit Telegram).")
+        await update.message.reply_text("❌ File lebih dari 2GB.")
         return
 
     await update.message.reply_video(video=open(filename, "rb"))
-
     os.remove(filename)
 
     await update.message.reply_text("✅ Selesai.")
 
-# ====== MESSAGE HANDLER ======
+# ===== HANDLER =====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     now = time.time()
 
-    # Cooldown
     if user_id in user_cooldowns:
         remaining = COOLDOWN - (now - user_cooldowns[user_id])
         if remaining > 0:
@@ -108,15 +106,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📥 Masuk antrian...")
     await queue.put(update)
 
-# ====== MAIN ======
-async def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+# ===== RUN =====
+app = ApplicationBuilder().token(TOKEN).build()
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    asyncio.create_task(worker())
+app.job_queue.run_once(lambda ctx: asyncio.create_task(worker(app)), 0)
 
-    print("Dood Remote Bot Running...")
-    await app.run_polling()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+print("Dood Remote Bot Running...")
+app.run_polling()
