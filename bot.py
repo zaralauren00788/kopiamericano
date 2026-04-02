@@ -97,6 +97,28 @@ async def handle_download(update, app):
 
 # === MAIN HANDLER ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    # Ambil semua URL dari pesan
+    urls = re.findall(r'(https?://[^\s]+)', text)
+
+    if not urls:
+        await update.message.reply_text("Kirim link DoodStream yang valid.")
+        return
+
+    user_id = update.message.from_user.id
+    now = time.time()
+
+    if user_id in user_cooldowns:
+        remaining = COOLDOWN - (now - user_cooldowns[user_id])
+        if remaining > 0:
+            await update.message.reply_text(f"⏳ Tunggu {int(remaining)} detik.")
+            return
+
+    user_cooldowns[user_id] = now
+
+    await update.message.reply_text("📥 Masuk antrian...")
+    await queue.put(update)
     global queue
 
     user_id = update.message.from_user.id
