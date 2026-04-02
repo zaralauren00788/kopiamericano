@@ -103,7 +103,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     # Auto detect dood variations
-    if not re.search(r"(dood\.\w+)", text):
+    if not re.search(r"(https?://[^\s]+)", text):
+    await update.message.reply_text("Kirim link DoodStream.")
+    return
         await update.message.reply_text("Kirim link DoodStream.")
         return
 
