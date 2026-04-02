@@ -1,81 +1,44 @@
 import os
 import re
 import time
-import asyncio
 import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
 TOKEN = os.getenv("BOT_TOKEN")
-DOOD_API_KEY = os.getenv("DOOD_API_KEY")
+STREAMTAPE_LOGIN = os.getenv("STREAMTAPE_LOGIN")
+STREAMTAPE_KEY = os.getenv("STREAMTAPE_KEY")
 
 if not TOKEN:
     raise ValueError("BOT_TOKEN tidak ditemukan!")
 
-if not DOOD_API_KEY:
-    raise ValueError("DOOD_API_KEY tidak ditemukan!")
+if not STREAMTAPE_LOGIN or not STREAMTAPE_KEY:
+    raise ValueError("Streamtape login/key belum di-set!")
 
 COOLDOWN = 30
-MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024
-
 user_cooldowns = {}
-queue = asyncio.Queue()
 
-# ===== GET DIRECT LINK =====
-def get_direct_link(url):
-    api = f"https://doodapi.com/api/file/direct_link?key={DOOD_API_KEY}&url={url}"
-    r = requests.get(api, timeout=30)
-    data = r.json()
-    if data.get("status") != 200:
-        return None
-    return data["result"]["download_url"]
+# =========================
+# Upload via URL
+# =========================
+def upload_url_to_streamtape(url):
+    api = f"https://api.streamtape.com/file/ul?login={STREAMTAPE_LOGIN}&key={STREAMTAPE_KEY}&url={url}"
+    r = requests.get(api, timeout=60)
+    return r.json()
 
-# ===== DOWNLOAD FILE =====
-def download_file(url, filename):
-    with requests.get(url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        with open(filename, "wb") as f:
-            for chunk in r.iter_content(8192):
-                if chunk:
-                    f.write(chunk)
+# =========================
+# Upload File Direct
+# =========================
+def upload_file_to_streamtape(filepath):
+    api = f"https://api.streamtape.com/file/ul?login={STREAMTAPE_LOGIN}&key={STREAMTAPE_KEY}"
+    files = {"file1": open(filepath, "rb")}
+    r = requests.post(api, files=files, timeout=300)
+    return r.json()
 
-# ===== PROCESS DOWNLOAD =====
-async def process_download(update: Update):
-    text = update.message.text.strip()
-    urls = re.findall(r'(https?://[^\s]+)', text)
-
-    if not urls:
-        await update.message.reply_text("❌ Link tidak valid.")
-        return
-
-    dood_url = urls[0]
-
-    await update.message.reply_text("⏳ Mengambil direct link...")
-
-    direct_link = await asyncio.to_thread(get_direct_link, dood_url)
-
-    if not direct_link:
-        await update.message.reply_text("❌ Gagal mendapatkan direct link.")
-        return
-
-    filename = "video.mp4"
-
-    await update.message.reply_text("⬇️ Downloading...")
-
-    await asyncio.to_thread(download_file, direct_link, filename)
-
-    if os.path.getsize(filename) > MAX_FILE_SIZE:
-        os.remove(filename)
-        await update.message.reply_text("❌ File lebih dari 2GB.")
-        return
-
-    await update.message.reply_video(video=open(filename, "rb"))
-    os.remove(filename)
-
-    await update.message.reply_text("✅ Selesai.")
-
-# ===== HANDLER =====
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================
+# Handle Text (URL Upload)
+# =========================
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     now = time.time()
 
@@ -87,11 +50,66 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_cooldowns[user_id] = now
 
-    await process_download(update)
+    urls = re.findall(r'(https?://[^\s]+)', update.message.text)
 
-# ===== RUN =====
+    if not urls:
+        await update.message.reply_text("❌ Kirim link yang valid.")
+        return
+
+    await update.message.reply_text("🚀 Remote upload ke Streamtape...")
+
+    result = upload_url_to_streamtape(urls[0])
+
+    if result.get("status") != 200:
+        await update.message.reply_text("❌ Upload gagal.")
+        return
+
+    link = result["result"]["url"]
+
+    await update.message.reply_text(f"✅ Upload selesai!\n\n🔗 {link}")
+
+# =========================
+# Handle File Upload
+# =========================
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    now = time.time()
+
+    if user_id in user_cooldowns:
+        remaining = COOLDOWN - (now - user_cooldowns[user_id])
+        if remaining > 0:
+            await update.message.reply_text(f"⏳ Tunggu {int(remaining)} detik.")
+            return
+
+    user_cooldowns[user_id] = now
+
+    await update.message.reply_text("⬇️ Download file dari Telegram...")
+
+    file = await update.message.document.get_file()
+    filepath = "upload.mp4"
+    await file.download_to_drive(filepath)
+
+    await update.message.reply_text("🚀 Upload ke Streamtape...")
+
+    result = upload_file_to_streamtape(filepath)
+
+    os.remove(filepath)
+
+    if result.get("status") != 200:
+        await update.message.reply_text("❌ Upload gagal.")
+        return
+
+    link = result["result"]["url"]
+
+    await update.message.reply_text(f"✅ Upload selesai!\n\n🔗 {link}")
+
+# =========================
+# RUN
+# =========================
 app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-print("Dood Remote Bot Running...")
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+
+print("Streamtape Bot Running...")
 app.run_polling()
