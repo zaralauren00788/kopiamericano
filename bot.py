@@ -25,12 +25,12 @@ daily_usage = defaultdict(lambda: {
 
 upload_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOAD)
 
-# ================= STREAMTAPE 2-STEP UPLOAD =================
+# ================= STREAMTAPE UPLOAD (2 STEP SAFE) =================
 
 def upload_to_streamtape(filepath):
 
     if not STREAMTAPE_LOGIN or not STREAMTAPE_KEY:
-        return {"status": "error", "message": "STREAMTAPE_LOGIN atau STREAMTAPE_KEY belum diset"}
+        return {"error": "STREAMTAPE_LOGIN atau STREAMTAPE_KEY belum diset di Railway"}
 
     try:
         # STEP 1: Request upload server
@@ -40,30 +40,38 @@ def upload_to_streamtape(filepath):
         )
 
         if not server_req.ok:
-            return {"status": "error", "message": f"Server request gagal: {server_req.text[:200]}"}
+            return {"error": f"Gagal request upload server: {server_req.text[:300]}"}
 
-        server_json = server_req.json()
+        try:
+            server_json = server_req.json()
+        except:
+            return {"error": f"Response bukan JSON:\n{server_req.text[:300]}"}
 
         if server_json.get("status") != 200:
-            return {"status": "error", "message": str(server_json)}
+            return {"error": f"API Error:\n{server_json}"}
 
-        upload_url = server_json["result"]["url"]
+        upload_url = server_json.get("result", {}).get("url")
 
-        # STEP 2: Upload file ke upload server
+        if not upload_url:
+            return {"error": f"Tidak ada upload URL:\n{server_json}"}
+
+        # STEP 2: Upload file
         with open(filepath, "rb") as f:
             files = {"file1": f}
             upload_req = requests.post(upload_url, files=files, timeout=1800)
 
         if not upload_req.ok:
-            return {"status": "error", "message": f"Upload gagal: {upload_req.text[:200]}"}
+            return {"error": f"Upload gagal:\n{upload_req.text[:300]}"}
 
-        if not upload_req.text:
-            return {"status": "error", "message": "Empty response saat upload"}
+        try:
+            upload_json = upload_req.json()
+        except:
+            return {"error": f"Upload response bukan JSON:\n{upload_req.text[:300]}"}
 
-        return upload_req.json()
+        return upload_json
 
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"error": str(e)}
 
 # ================= DAILY LIMIT =================
 
@@ -81,7 +89,7 @@ def check_daily_limit(user_id):
 def increase_daily(user_id):
     daily_usage[user_id]["count"] += 1
 
-# ================= HANDLER =================
+# ================= VIDEO HANDLER =================
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -93,7 +101,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not video:
             return
 
-        # LIMIT CHECK
+        # LIMIT
         if not check_daily_limit(user.id):
             await update.message.reply_text("❌ Limit upload harian tercapai (10 per hari).")
             return
@@ -120,18 +128,29 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(None, upload_to_streamtape, filepath)
 
-            if isinstance(result.get("status"), int) and result.get("status") == 200:
-                file_id = result["result"]["file_id"]
+            # HANDLE ERROR
+            if result.get("error"):
+                await status_msg.edit_text(f"❌ Upload gagal:\n\n{result['error']}")
+                return
+
+            # VALIDATE SUCCESS
+            if result.get("status") == 200:
+                file_id = result.get("result", {}).get("file_id")
+
+                if not file_id:
+                    await status_msg.edit_text(
+                        f"❌ Upload gagal.\n\nResponse tidak mengandung file_id:\n{result}"
+                    )
+                    return
+
                 link = f"https://streamtape.com/v/{file_id}"
 
                 await status_msg.edit_text("✅ Upload berhasil!")
                 await update.message.reply_text(f"🔗 {link}")
 
                 increase_daily(user.id)
-
             else:
-                error_msg = result.get("message", "Unknown error")
-                await status_msg.edit_text(f"❌ Upload gagal.\n\n{error_msg}")
+                await status_msg.edit_text(f"❌ Upload gagal.\n\nResponse:\n{result}")
 
         except Exception as e:
             await status_msg.edit_text(f"❌ Terjadi error:\n{str(e)}")
