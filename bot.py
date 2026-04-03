@@ -13,10 +13,9 @@ from telegram.ext import (
     filters,
 )
 
-BOT_TOKEN = os.getenv("8731396569:AAFIv2u2PfpDme6FEPnEzXJ5_ngaWazvbgA")
-ADMIN_ID = 7688712382  # GANTI
-FORCE_CHANNELS = ["https://t.me/viral17menit", "https://t.me/doodstreamviral2026"]  # BISA BANYAK
-
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = 7688712382
+FORCE_CHANNELS = ["@viral17menit", "@doodstreamviral2026"]
 DB_NAME = "ultra_files.db"
 
 
