@@ -1,182 +1,229 @@
 import os
 import asyncio
 import requests
+import aiosqlite
 from datetime import datetime
-from collections import defaultdict
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    CommandHandler,
+    ContextTypes,
+    filters,
+)
 
 # ================= CONFIG =================
 
 TOKEN = os.getenv("BOT_TOKEN")
-STREAMTAPE_LOGIN = os.getenv("STREAMTAPE_LOGIN")
-STREAMTAPE_KEY = os.getenv("STREAMTAPE_KEY")
+LOGIN = os.getenv("STREAMTAPE_LOGIN")
+KEY = os.getenv("STREAMTAPE_KEY")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
-MAX_FILE_SIZE = 1024 * 1024 * 1024  # 1GB
-MAX_UPLOAD_PER_DAY = 10
-MAX_CONCURRENT_UPLOAD = 2
+DB_NAME = "database.db"
+MAX_CONCURRENT = 2
 
-# ================= STATE =================
+semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-daily_usage = defaultdict(lambda: {
-    "count": 0,
-    "date": str(datetime.utcnow().date())
-})
+# ================= DATABASE =================
 
-upload_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPLOAD)
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            is_vip INTEGER DEFAULT 0,
+            daily_limit INTEGER DEFAULT 10,
+            used_today INTEGER DEFAULT 0,
+            last_reset TEXT
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            url TEXT,
+            status TEXT DEFAULT 'pending',
+            result_link TEXT,
+            created_at TEXT
+        )
+        """)
+        await db.commit()
 
-# ================= STREAMTAPE UPLOAD (2 STEP SAFE) =================
+# ================= RESET LIMIT =================
 
-def upload_to_streamtape(filepath):
+async def check_reset(user_id):
+    today = datetime.utcnow().date()
 
-    if not STREAMTAPE_LOGIN or not STREAMTAPE_KEY:
-        return {"error": "STREAMTAPE_LOGIN atau STREAMTAPE_KEY belum diset di Railway"}
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT last_reset FROM users WHERE user_id=?",
+            (user_id,)
+        )
+        row = await cursor.fetchone()
 
-    try:
-        # STEP 1: Request upload server
-        server_req = requests.get(
-            f"https://api.streamtape.com/file/ul?login={STREAMTAPE_LOGIN}&key={STREAMTAPE_KEY}",
-            timeout=60
+        if not row or not row[0]:
+            await db.execute(
+                "UPDATE users SET used_today=0, last_reset=? WHERE user_id=?",
+                (str(today), user_id)
+            )
+        else:
+            last = datetime.fromisoformat(row[0]).date()
+            if last != today:
+                await db.execute(
+                    "UPDATE users SET used_today=0, last_reset=? WHERE user_id=?",
+                    (str(today), user_id)
+                )
+
+        await db.commit()
+
+# ================= STREAMTAPE REMOTE =================
+
+def remote_upload(url):
+    api = f"https://api.streamtape.com/remotedl/add?login={LOGIN}&key={KEY}&url={url}"
+    r = requests.get(api, timeout=30)
+    return r.json()
+
+# ================= QUEUE WORKER =================
+
+async def worker(app):
+    while True:
+        async with semaphore:
+            async with aiosqlite.connect(DB_NAME) as db:
+                cursor = await db.execute(
+                    "SELECT id, user_id, url FROM queue WHERE status='pending' ORDER BY id ASC LIMIT 1"
+                )
+                job = await cursor.fetchone()
+
+                if job:
+                    job_id, user_id, url = job
+
+                    await db.execute(
+                        "UPDATE queue SET status='uploading' WHERE id=?",
+                        (job_id,)
+                    )
+                    await db.commit()
+
+                    try:
+                        result = remote_upload(url)
+
+                        if result.get("status") == 200:
+                            file_id = result["result"]["file_id"]
+                            link = f"https://streamtape.com/v/{file_id}"
+
+                            await db.execute(
+                                "UPDATE queue SET status='done', result_link=? WHERE id=?",
+                                (link, job_id)
+                            )
+                            await db.commit()
+
+                            await app.bot.send_message(
+                                user_id,
+                                f"✅ Upload selesai:\n{link}"
+                            )
+                        else:
+                            raise Exception("Upload gagal API")
+
+                    except Exception as e:
+                        await db.execute(
+                            "UPDATE queue SET status='failed' WHERE id=?",
+                            (job_id,)
+                        )
+                        await db.commit()
+
+                        await app.bot.send_message(
+                            user_id,
+                            f"❌ Upload gagal:\n{str(e)}"
+                        )
+
+        await asyncio.sleep(5)
+
+# ================= HANDLER =================
+
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    url = update.message.text.strip()
+
+    async with aiosqlite.connect(DB_NAME) as db:
+
+        await db.execute(
+            "INSERT OR IGNORE INTO users (user_id, last_reset) VALUES (?, ?)",
+            (user_id, str(datetime.utcnow().date()))
+        )
+        await db.commit()
+
+    await check_reset(user_id)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT is_vip, daily_limit, used_today FROM users WHERE user_id=?",
+            (user_id,)
+        )
+        user = await cursor.fetchone()
+
+        is_vip, limit, used = user
+
+        if used >= limit:
+            await update.message.reply_text("❌ Limit upload harian habis.")
+            return
+
+        await db.execute(
+            "INSERT INTO queue (user_id, url, created_at) VALUES (?, ?, ?)",
+            (user_id, url, str(datetime.utcnow()))
         )
 
-        if not server_req.ok:
-            return {"error": f"Gagal request upload server: {server_req.text[:300]}"}
+        await db.execute(
+            "UPDATE users SET used_today = used_today + 1 WHERE user_id=?",
+            (user_id,)
+        )
 
-        try:
-            server_json = server_req.json()
-        except:
-            return {"error": f"Response bukan JSON:\n{server_req.text[:300]}"}
+        await db.commit()
 
-        if server_json.get("status") != 200:
-            return {"error": f"API Error:\n{server_json}"}
+    await update.message.reply_text("📦 Link masuk antrian upload...")
 
-        upload_url = server_json.get("result", {}).get("url")
+# ================= ADMIN COMMAND =================
 
-        if not upload_url:
-            return {"error": f"Tidak ada upload URL:\n{server_json}"}
+async def add_vip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        return
 
-        # STEP 2: Upload file
-        with open(filepath, "rb") as f:
-            files = {"file1": f}
-            upload_req = requests.post(upload_url, files=files, timeout=1800)
+    try:
+        target_id = int(context.args[0])
+    except:
+        await update.message.reply_text("Format: /vip user_id")
+        return
 
-        if not upload_req.ok:
-            return {"error": f"Upload gagal:\n{upload_req.text[:300]}"}
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE users SET is_vip=1, daily_limit=100 WHERE user_id=?",
+            (target_id,)
+        )
+        await db.commit()
 
-        try:
-            upload_json = upload_req.json()
-        except:
-            return {"error": f"Upload response bukan JSON:\n{upload_req.text[:300]}"}
+    await update.message.reply_text("👑 User dijadikan VIP.")
 
-        return upload_json
+# ================= STATUS =================
 
-    except Exception as e:
-        return {"error": str(e)}
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM queue WHERE status='pending'"
+        )
+        pending = (await cursor.fetchone())[0]
 
-# ================= DAILY LIMIT =================
-
-def check_daily_limit(user_id):
-    today = str(datetime.utcnow().date())
-
-    if daily_usage[user_id]["date"] != today:
-        daily_usage[user_id] = {
-            "count": 0,
-            "date": today
-        }
-
-    return daily_usage[user_id]["count"] < MAX_UPLOAD_PER_DAY
-
-def increase_daily(user_id):
-    daily_usage[user_id]["count"] += 1
-
-# ================= VIDEO HANDLER =================
-
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    async with upload_semaphore:
-
-        user = update.message.from_user
-        video = update.message.video or update.message.document
-
-        if not video:
-            return
-
-        # LIMIT
-        if not check_daily_limit(user.id):
-            await update.message.reply_text("❌ Limit upload harian tercapai (10 per hari).")
-            return
-
-        # SIZE CHECK
-        if video.file_size > MAX_FILE_SIZE:
-            await update.message.reply_text("❌ File terlalu besar. Maksimal 1GB.")
-            return
-
-        status_msg = await update.message.reply_text("⬇️ Downloading...")
-
-        filepath = None
-
-        try:
-            tg_file = await context.bot.get_file(video.file_id)
-
-            filename = f"{datetime.utcnow().timestamp()}_{video.file_unique_id}.mp4"
-            filepath = f"/tmp/{filename}"
-
-            await tg_file.download_to_drive(filepath)
-
-            await status_msg.edit_text("⬆️ Uploading ke Streamtape...")
-
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, upload_to_streamtape, filepath)
-
-            # HANDLE ERROR
-            if result.get("error"):
-                await status_msg.edit_text(f"❌ Upload gagal:\n\n{result['error']}")
-                return
-
-            # VALIDATE SUCCESS
-            if result.get("status") == 200:
-                file_id = result.get("result", {}).get("file_id")
-
-                if not file_id:
-                    await status_msg.edit_text(
-                        f"❌ Upload gagal.\n\nResponse tidak mengandung file_id:\n{result}"
-                    )
-                    return
-
-                link = f"https://streamtape.com/v/{file_id}"
-
-                await status_msg.edit_text("✅ Upload berhasil!")
-                await update.message.reply_text(f"🔗 {link}")
-
-                increase_daily(user.id)
-            else:
-                await status_msg.edit_text(f"❌ Upload gagal.\n\nResponse:\n{result}")
-
-        except Exception as e:
-            await status_msg.edit_text(f"❌ Terjadi error:\n{str(e)}")
-
-        finally:
-            if filepath and os.path.exists(filepath):
-                os.remove(filepath)
+    await update.message.reply_text(f"📦 Antrian pending: {pending}")
 
 # ================= MAIN =================
 
-if not TOKEN:
-    print("BOT_TOKEN belum diset.")
-    exit()
-
 app = ApplicationBuilder().token(TOKEN).build()
 
-app.add_handler(
-    MessageHandler(
-        filters.VIDEO | filters.Document.VIDEO,
-        handle_video
-    )
-)
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+app.add_handler(CommandHandler("vip", add_vip))
+app.add_handler(CommandHandler("status", status))
 
-print("🔥 Streamtape Upload Bot Running...")
+async def main():
+    await init_db()
+    asyncio.create_task(worker(app))
+    await app.run_polling()
 
-app.run_polling(
-    drop_pending_updates=True,
-    allowed_updates=Update.ALL_TYPES
-)
+if __name__ == "__main__":
+    asyncio.run(main())
