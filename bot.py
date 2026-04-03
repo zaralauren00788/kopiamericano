@@ -17,11 +17,10 @@ from telegram.ext import (
 TOKEN = os.getenv("BOT_TOKEN")
 LOGIN = os.getenv("STREAMTAPE_LOGIN")
 KEY = os.getenv("STREAMTAPE_KEY")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "2"))
 
 DB_NAME = "database.db"
-MAX_CONCURRENT = 2
-
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 # ================= DATABASE =================
@@ -49,7 +48,7 @@ async def init_db():
         """)
         await db.commit()
 
-# ================= RESET LIMIT =================
+# ================= RESET DAILY LIMIT =================
 
 async def check_reset(user_id):
     today = datetime.utcnow().date()
@@ -80,10 +79,10 @@ async def check_reset(user_id):
 
 def remote_upload(url):
     api = f"https://api.streamtape.com/remotedl/add?login={LOGIN}&key={KEY}&url={url}"
-    r = requests.get(api, timeout=30)
+    r = requests.get(api, timeout=60)
     return r.json()
 
-# ================= QUEUE WORKER =================
+# ================= WORKER =================
 
 async def worker(app):
     while True:
@@ -121,7 +120,7 @@ async def worker(app):
                                 f"✅ Upload selesai:\n{link}"
                             )
                         else:
-                            raise Exception("Upload gagal API")
+                            raise Exception(str(result))
 
                     except Exception as e:
                         await db.execute(
@@ -132,10 +131,10 @@ async def worker(app):
 
                         await app.bot.send_message(
                             user_id,
-                            f"❌ Upload gagal:\n{str(e)}"
+                            f"❌ Upload gagal:\n{e}"
                         )
 
-        await asyncio.sleep(5)
+        await asyncio.sleep(3)
 
 # ================= HANDLER =================
 
@@ -144,7 +143,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
 
     async with aiosqlite.connect(DB_NAME) as db:
-
         await db.execute(
             "INSERT OR IGNORE INTO users (user_id, last_reset) VALUES (?, ?)",
             (user_id, str(datetime.utcnow().date()))
@@ -155,12 +153,12 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
-            "SELECT is_vip, daily_limit, used_today FROM users WHERE user_id=?",
+            "SELECT daily_limit, used_today FROM users WHERE user_id=?",
             (user_id,)
         )
         user = await cursor.fetchone()
 
-        is_vip, limit, used = user
+        limit, used = user
 
         if used >= limit:
             await update.message.reply_text("❌ Limit upload harian habis.")
@@ -186,11 +184,11 @@ async def add_vip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
 
-    try:
-        target_id = int(context.args[0])
-    except:
+    if not context.args:
         await update.message.reply_text("Format: /vip user_id")
         return
+
+    target_id = int(context.args[0])
 
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
@@ -200,8 +198,6 @@ async def add_vip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.commit()
 
     await update.message.reply_text("👑 User dijadikan VIP.")
-
-# ================= STATUS =================
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with aiosqlite.connect(DB_NAME) as db:
