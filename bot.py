@@ -14,9 +14,9 @@ STREAMTAPE_LOGIN = os.getenv("STREAMTAPE_LOGIN")
 STREAMTAPE_KEY = os.getenv("STREAMTAPE_KEY")
 
 
-# ================= START COMMAND =================
+# ================= START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Kirim video untuk diupload ke Streamtape.")
+    await update.message.reply_text("Kirim video untuk diupload ke Streamtape (max 2GB).")
 
 
 # ================= GET UPLOAD SERVER =================
@@ -24,16 +24,10 @@ def get_upload_server():
     url = f"https://api.streamtape.com/file/ul?login={STREAMTAPE_LOGIN}&key={STREAMTAPE_KEY}"
     response = requests.get(url)
 
-    print("Upload server status:", response.status_code)
-    print("Upload server response:", response.text)
-
     if response.status_code != 200:
         raise Exception("Gagal ambil upload server")
 
-    try:
-        data = response.json()
-    except:
-        raise Exception("Response bukan JSON (cek login/key Streamtape)")
+    data = response.json()
 
     if data.get("status") != 200:
         raise Exception(f"Streamtape API error: {data}")
@@ -50,49 +44,42 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("File tidak valid.")
         return
 
-    await message.reply_text("Downloading file...")
-
-    telegram_file = await context.bot.get_file(file.file_id)
-    file_path = "video_upload"
-
-    await telegram_file.download_to_drive(file_path)
-
-    await message.reply_text("Uploading ke Streamtape...")
+    await message.reply_text("Memproses...")
 
     try:
+        # Ambil file info dari Telegram
+        telegram_file = await context.bot.get_file(file.file_id)
+
+        # Ini URL langsung dari Telegram (bisa sampai 2GB)
+        telegram_file_url = telegram_file.file_path
+
         upload_url = get_upload_server()
 
-        with open(file_path, "rb") as f:
-            files = {"file1": f}
-            response = requests.post(upload_url, files=files)
+        # Kirim URL langsung ke Streamtape
+        data = {
+            "url": telegram_file_url
+        }
 
-        print("Upload status:", response.status_code)
+        response = requests.post(upload_url, data=data)
+
         print("Upload response:", response.text)
 
-        try:
-            data = response.json()
-        except:
-            raise Exception("Upload response bukan JSON")
+        result = response.json()
 
-        if data.get("status") != 200:
-            raise Exception(f"Upload gagal: {data}")
+        if result.get("status") != 200:
+            raise Exception(f"Upload gagal: {result}")
 
-        result = data["result"]
-        link = result.get("url")
+        link = result["result"]["url"]
 
         await message.reply_text(f"Upload berhasil!\n{link}")
 
     except Exception as e:
         await message.reply_text(f"ERROR: {str(e)}")
 
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
 
 # ================= MAIN =================
 def main():
-    print("=== BOT STARTING ===")
+    print("=== BOT STARTING (PRO 2GB MODE) ===")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -101,17 +88,9 @@ def main():
         MessageHandler(filters.VIDEO | filters.Document.ALL, handle_video)
     )
 
-    print("Clearing old webhook...")
-
-    # Anti conflict polling
     app.bot.delete_webhook(drop_pending_updates=True)
 
-    print("=== RUNNING POLLING ===")
-
-    app.run_polling(
-        drop_pending_updates=True,
-        close_loop=False,
-    )
+    app.run_polling(drop_pending_updates=True, close_loop=False)
 
 
 if __name__ == "__main__":
