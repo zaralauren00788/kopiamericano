@@ -1,5 +1,5 @@
 import os
-import requests
+import aiohttp
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -14,28 +14,22 @@ STREAMTAPE_LOGIN = os.getenv("STREAMTAPE_LOGIN")
 STREAMTAPE_KEY = os.getenv("STREAMTAPE_KEY")
 
 
-# ================= START =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Kirim video untuk diupload ke Streamtape (max 2GB).")
+    await update.message.reply_text("Kirim video untuk upload ke Streamtape (max 2GB).")
 
 
-# ================= GET UPLOAD SERVER =================
-def get_upload_server():
+async def get_upload_server():
     url = f"https://api.streamtape.com/file/ul?login={STREAMTAPE_LOGIN}&key={STREAMTAPE_KEY}"
-    response = requests.get(url)
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            data = await resp.json()
 
-    if response.status_code != 200:
-        raise Exception("Gagal ambil upload server")
+            if data.get("status") != 200:
+                raise Exception(f"Gagal ambil upload server: {data}")
 
-    data = response.json()
-
-    if data.get("status") != 200:
-        raise Exception(f"Streamtape API error: {data}")
-
-    return data["result"]["url"]
+            return data["result"]["url"]
 
 
-# ================= HANDLE VIDEO =================
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     file = message.video or message.document
@@ -47,24 +41,14 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text("Memproses...")
 
     try:
-        # Ambil file info dari Telegram
         telegram_file = await context.bot.get_file(file.file_id)
-
-        # Ini URL langsung dari Telegram (bisa sampai 2GB)
         telegram_file_url = telegram_file.file_path
 
-        upload_url = get_upload_server()
+        upload_url = await get_upload_server()
 
-        # Kirim URL langsung ke Streamtape
-        data = {
-            "url": telegram_file_url
-        }
-
-        response = requests.post(upload_url, data=data)
-
-        print("Upload response:", response.text)
-
-        result = response.json()
+        async with aiohttp.ClientSession() as session:
+            async with session.post(upload_url, data={"url": telegram_file_url}) as resp:
+                result = await resp.json()
 
         if result.get("status") != 200:
             raise Exception(f"Upload gagal: {result}")
@@ -77,9 +61,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text(f"ERROR: {str(e)}")
 
 
-# ================= MAIN =================
 def main():
-    print("=== BOT STARTING (PRO 2GB MODE) ===")
+    print("=== BOT STARTING (PRO STABLE MODE) ===")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -90,7 +73,7 @@ def main():
 
     app.bot.delete_webhook(drop_pending_updates=True)
 
-    app.run_polling(drop_pending_updates=True, close_loop=False)
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
