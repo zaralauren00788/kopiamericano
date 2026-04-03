@@ -48,7 +48,7 @@ async def init_db():
         """)
         await db.commit()
 
-# ================= RESET DAILY LIMIT =================
+# ================= DAILY RESET =================
 
 async def check_reset(user_id):
     today = datetime.utcnow().date()
@@ -84,7 +84,7 @@ def remote_upload(url):
 
 # ================= WORKER =================
 
-async def worker(app):
+async def worker(application):
     while True:
         async with semaphore:
             async with aiosqlite.connect(DB_NAME) as db:
@@ -115,9 +115,9 @@ async def worker(app):
                             )
                             await db.commit()
 
-                            await app.bot.send_message(
-                                user_id,
-                                f"✅ Upload selesai:\n{link}"
+                            await application.bot.send_message(
+                                chat_id=user_id,
+                                text=f"✅ Upload selesai:\n{link}"
                             )
                         else:
                             raise Exception(str(result))
@@ -129,9 +129,9 @@ async def worker(app):
                         )
                         await db.commit()
 
-                        await app.bot.send_message(
-                            user_id,
-                            f"❌ Upload gagal:\n{e}"
+                        await application.bot.send_message(
+                            chat_id=user_id,
+                            text=f"❌ Upload gagal:\n{e}"
                         )
 
         await asyncio.sleep(3)
@@ -208,18 +208,20 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"📦 Antrian pending: {pending}")
 
-# ================= MAIN =================
+# ================= START BOT =================
 
-app = ApplicationBuilder().token(TOKEN).build()
+def main():
+    app = ApplicationBuilder().token(TOKEN).build()
 
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-app.add_handler(CommandHandler("vip", add_vip))
-app.add_handler(CommandHandler("status", status))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    app.add_handler(CommandHandler("vip", add_vip))
+    app.add_handler(CommandHandler("status", status))
 
-async def main():
-    await init_db()
-    asyncio.create_task(worker(app))
-    await app.run_polling()
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(init_db())
+    loop.create_task(worker(app))
+
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
