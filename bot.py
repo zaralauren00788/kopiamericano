@@ -13,98 +13,98 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 STREAMTAPE_LOGIN = os.getenv("STREAMTAPE_LOGIN")
 STREAMTAPE_KEY = os.getenv("STREAMTAPE_KEY")
 
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN tidak ditemukan!")
 
-if not STREAMTAPE_LOGIN or not STREAMTAPE_KEY:
-    raise ValueError("STREAMTAPE_LOGIN / STREAMTAPE_KEY belum di-set!")
-
-# =========================
-# COMMAND
-# =========================
-
+# ================= START COMMAND =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Kirim video untuk upload ke Streamtape 🚀")
+    await update.message.reply_text("Kirim video untuk diupload ke Streamtape.")
 
-# =========================
-# UPLOAD HANDLER
-# =========================
 
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================= GET UPLOAD SERVER =================
+def get_upload_server():
+    url = f"https://api.streamtape.com/file/ul?login={STREAMTAPE_LOGIN}&key={STREAMTAPE_KEY}"
+    response = requests.get(url)
+
+    print("Upload server status:", response.status_code)
+    print("Upload server response:", response.text)
+
+    if response.status_code != 200:
+        raise Exception("Gagal ambil upload server")
+
     try:
-        await update.message.reply_text("Downloading file...")
+        data = response.json()
+    except:
+        raise Exception("Response bukan JSON (cek login/key Streamtape)")
 
-        file = None
+    if data.get("status") != 200:
+        raise Exception(f"Streamtape API error: {data}")
 
-        if update.message.video:
-            file = await update.message.video.get_file()
-            filename = update.message.video.file_name or "video.mp4"
-        elif update.message.document:
-            file = await update.message.document.get_file()
-            filename = update.message.document.file_name or "file.mp4"
-        else:
-            await update.message.reply_text("Kirim video atau file ya.")
-            return
+    return data["result"]["url"]
 
-        filepath = f"/tmp/{filename}"
 
-        # Download ke disk (bukan RAM)
-        await file.download_to_drive(filepath)
+# ================= HANDLE VIDEO =================
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    file = message.video or message.document
 
-        await update.message.reply_text("Uploading ke Streamtape...")
+    if not file:
+        await message.reply_text("File tidak valid.")
+        return
 
-        # Step 1: Ambil upload server
-        server_res = requests.get(
-            "https://api.streamtape.com/file/ul",
-            params={
-                "login": STREAMTAPE_LOGIN,
-                "key": STREAMTAPE_KEY,
-            },
-        ).json()
+    await message.reply_text("Downloading file...")
 
-        if server_res["status"] != 200:
-            await update.message.reply_text("Gagal ambil server upload.")
-            return
+    telegram_file = await context.bot.get_file(file.file_id)
+    file_path = "video_upload"
 
-        upload_url = server_res["result"]["url"]
+    await telegram_file.download_to_drive(file_path)
 
-        # Step 2: Upload file
-        with open(filepath, "rb") as f:
-            upload_res = requests.post(
-                upload_url,
-                files={"file1": f},
-                data={
-                    "login": STREAMTAPE_LOGIN,
-                    "key": STREAMTAPE_KEY,
-                },
-            ).json()
+    await message.reply_text("Uploading ke Streamtape...")
 
-        if upload_res["status"] != 200:
-            await update.message.reply_text("Upload gagal.")
-            return
+    try:
+        upload_url = get_upload_server()
 
-        link = upload_res["result"]["url"]
+        with open(file_path, "rb") as f:
+            files = {"file1": f}
+            response = requests.post(upload_url, files=files)
 
-        await update.message.reply_text(f"Upload berhasil ✅\n\n{link}")
+        print("Upload status:", response.status_code)
+        print("Upload response:", response.text)
 
-        # Hapus file lokal
-        os.remove(filepath)
+        try:
+            data = response.json()
+        except:
+            raise Exception("Upload response bukan JSON")
+
+        if data.get("status") != 200:
+            raise Exception(f"Upload gagal: {data}")
+
+        result = data["result"]
+        link = result.get("url")
+
+        await message.reply_text(f"Upload berhasil!\n{link}")
 
     except Exception as e:
-        print("ERROR:", e)
-        await update.message.reply_text(f"Terjadi error:\n{e}")
+        await message.reply_text(f"ERROR: {str(e)}")
 
-# =========================
-# MAIN
-# =========================
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
+
+# ================= MAIN =================
 def main():
     print("=== BOT STARTING ===")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, handle_video))
+    app.add_handler(
+        MessageHandler(filters.VIDEO | filters.Document.ALL, handle_video)
+    )
+
+    print("Clearing old webhook...")
+
+    # Anti conflict polling
+    app.bot.delete_webhook(drop_pending_updates=True)
 
     print("=== RUNNING POLLING ===")
 
@@ -112,6 +112,7 @@ def main():
         drop_pending_updates=True,
         close_loop=False,
     )
+
 
 if __name__ == "__main__":
     main()
